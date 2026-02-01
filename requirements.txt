@@ -1,0 +1,11 @@
+# Project dependencies
+requests
+numpy
+opencv-python
+rasterio
+scipy
+matplotlib
+python-dotenv
+sentinelsat
+geojson
+pyproj
