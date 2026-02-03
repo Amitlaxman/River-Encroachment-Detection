@@ -9,3 +9,6 @@ python-dotenv
 sentinelsat
 geojson
 pyproj
+earthaccess
+xarray
+rioxarray

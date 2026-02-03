@@ -1,46 +1,64 @@
 """
-Sentinel-2 image downloader from Earth Data (NASA/USGS)
-Downloads cloud-free images for before and after dates
+Sentinel-2 image downloader using NASA Earthaccess library
+Downloads cloud-free images using Earthdata credentials
 """
 
 import os
 import json
-import requests
 import numpy as np
 import cv2
 from datetime import datetime, timedelta
 from pathlib import Path
+import earthaccess
+import xarray as xr
+import rioxarray as rxr
+import geopandas as gpd
+
+from config.settings import (
+    ENABLE_IMAGE_ENHANCEMENT,
+    PERCENTILE_LOW,
+    PERCENTILE_HIGH,
+    CLAHE_CLIP_LIMIT,
+    CLAHE_TILE_GRID_SIZE,
+    SATURATION_BOOST,
+    GAMMA,
+)
 
 
 class Sentinel2Downloader:
-    """Download and process Sentinel-2 images from Earth Data"""
+    """Download and process Sentinel-2 images using earthaccess API"""
     
-    # Copernicus Data Space Ecosystem (CDSE) API endpoint for Sentinel-2
-    CDSE_SEARCH_URL = "https://catalogue.dataspace.copernicus.eu/resto/api/collections/Sentinel2/search.json"
-    
-    def __init__(self, username=None, password=None, geojson_path=None, token=None):
+    def __init__(self, username=None, password=None, geojson_path=None, token=None, zoom_factor=1.0):
         """
         Initialize downloader with Earthdata credentials
         
         Args:
-            username: Earthdata/Sentinel username
-            password: Earthdata/Sentinel password
-            geojson_path: Path to GeoJSON file with area of interest (absolute or relative)
-            token: Optional Bearer token for Earthdata (preferred over username/password)
+            username: Earthdata username
+            password: Earthdata password
+            geojson_path: Path to GeoJSON file with area of interest
+            token: Optional token (not used; kept for compatibility)
         """
         self.username = username
         self.password = password
-        self.token = token
-        self.session = requests.Session()
-        # Prefer token-based auth if provided
-        if token:
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
-        elif username and password:
-            self.session.auth = (username, password)
         
-        # Convert to absolute path if relative
+        # Set environment variables for earthaccess
+        if username and password:
+            os.environ['EARTHDATA_USERNAME'] = username
+            os.environ['EARTHDATA_PASSWORD'] = password
+        
+        # Login to earthaccess
+        print(f"[+] Authenticating with Earthdata...")
+        try:
+            session = earthaccess.login(strategy='environment', persist=False)
+            if session:
+                print(f"[+] Earthdata authentication successful")
+            else:
+                print(f"[!] Warning: Earthdata login failed")
+        except Exception as e:
+            print(f"[!] Warning: Earthdata login failed: {e}")
+        
+        # Handle geojson path
         if not os.path.isabs(geojson_path):
-            # Get the encroachment_detection directory
             script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             geojson_path = os.path.join(script_dir, geojson_path)
         
@@ -48,23 +66,76 @@ class Sentinel2Downloader:
         with open(geojson_path, 'r') as f:
             self.geojson = json.load(f)
         
-        # Extract bounds from GeoJSON
+        # Load GeoDataFrame for clipping (following notebook pattern)
+        self.field = gpd.read_file(geojson_path)
+        if self.field.crs is None:
+            # GeoJSON is assumed WGS84 when CRS is missing
+            self.field.set_crs("EPSG:4326", inplace=True)
+        
+        # Factor to expand the GeoJSON bounding box (1.0 = no change)
+        self.zoom_factor = float(zoom_factor) if zoom_factor else 1.0
+
         self.bounds = self._extract_bounds()
+
+    def _normalize_to_uint8(self, img):
+        """Normalize a float/uint image to uint8 using min/max scaling."""
+        img_min, img_max = img.min(), img.max()
+        if img_max > img_min:
+            img = (img - img_min) / (img_max - img_min)
+        img = np.clip(img, 0, 1)
+        return (img * 255.0).astype(np.uint8)
+
+    def _enhance_bgr(self, bgr):
+        """Enhance contrast and saturation for hazy/washed imagery."""
+        if not ENABLE_IMAGE_ENHANCEMENT:
+            return bgr
+
+        # Percentile stretch per channel
+        stretched = bgr.astype(np.float32)
+        for c in range(3):
+            low = np.percentile(stretched[:, :, c], PERCENTILE_LOW)
+            high = np.percentile(stretched[:, :, c], PERCENTILE_HIGH)
+            if high > low:
+                stretched[:, :, c] = (stretched[:, :, c] - low) / (high - low)
+        stretched = np.clip(stretched, 0, 1)
+
+        if GAMMA and GAMMA != 1.0:
+            stretched = np.power(stretched, 1.0 / GAMMA)
+
+        enhanced = (stretched * 255.0).astype(np.uint8)
+
+        # CLAHE on luminance channel (LAB)
+        if CLAHE_CLIP_LIMIT and CLAHE_CLIP_LIMIT > 0:
+            lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(
+                clipLimit=CLAHE_CLIP_LIMIT,
+                tileGridSize=(CLAHE_TILE_GRID_SIZE, CLAHE_TILE_GRID_SIZE),
+            )
+            l = clahe.apply(l)
+            lab = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # Boost saturation (HSV)
+        if SATURATION_BOOST and SATURATION_BOOST != 1.0:
+            hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * SATURATION_BOOST, 0, 255)
+            enhanced = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+        return enhanced
     
     def _extract_bounds(self):
         """Extract bounding box from GeoJSON"""
         feature = self.geojson['features'][0]
         geometry = feature['geometry']
         
-        # Handle different coordinate structures
         if geometry['type'] == 'Polygon':
-            coords = geometry['coordinates'][0]  # Outer ring of polygon
+            coords = geometry['coordinates'][0]
         elif geometry['type'] == 'MultiPolygon':
-            coords = geometry['coordinates'][0][0]  # First polygon, outer ring
+            coords = geometry['coordinates'][0][0]
         else:
             coords = geometry['coordinates']
         
-        # Extract longitude and latitude
         lons = [float(c[0]) for c in coords]
         lats = [float(c[1]) for c in coords]
         
@@ -81,28 +152,24 @@ class Sentinel2Downloader:
         
         Args:
             output_dir: Directory to save images
-            current_date: Current date (datetime object), defaults to today
+            current_date: Current date (datetime), defaults to today
             cloud_threshold: Maximum cloud cover percentage (0-100)
         
         Returns:
             Tuple of (before_image_path, after_image_path)
         """
-        if current_date is None:
-            current_date = datetime.now()
+        # Use 2024 and 2025 as before and after dates
+        before_date = datetime(2024, 2, 3)
+        after_date = datetime(2025, 2, 3)
         
-        # Calculate dates
-        after_date = current_date
-        before_date = current_date - timedelta(days=365)
-        
-        print(f"Downloading Sentinel-2 images...")
+        print(f"\nDownloading Sentinel-2 images...")
         print(f"Before date: {before_date.strftime('%Y-%m-%d')}")
         print(f"After date: {after_date.strftime('%Y-%m-%d')}")
-        print(f"Area: {self.bounds}")
+        print(f"Area bounds: {self.bounds}")
         print(f"Max cloud cover: {cloud_threshold}%")
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Download images
         before_path = self._search_and_download(
             before_date, output_dir, "before.jpg", cloud_threshold
         )
@@ -125,185 +192,279 @@ class Sentinel2Downloader:
         Returns:
             Path to downloaded and processed image
         """
-        # Build search parameters for Copernicus Data Space Ecosystem (CDSE)
-        start_date = (target_date - timedelta(days=15)).strftime('%Y-%m-%dT00:00:00Z')
-        end_date = (target_date + timedelta(days=15)).strftime('%Y-%m-%dT23:59:59Z')
+        # Use wider search window (±30 days) for better coverage
+        start_date = (target_date - timedelta(days=30)).strftime('%Y-%m-%d')
+        end_date = (target_date + timedelta(days=30)).strftime('%Y-%m-%d')
+        
+        # Expand bounding box by zoom_factor around its center
+        min_lon = float(self.bounds['min_lon'])
+        max_lon = float(self.bounds['max_lon'])
+        min_lat = float(self.bounds['min_lat'])
+        max_lat = float(self.bounds['max_lat'])
 
-        params = {
-            'startDate': start_date,
-            'completionDate': end_date,
-            # cloudCover expects a range in brackets: [min,max]
-            'cloudCover': f"[0,{int(cloud_threshold)}]",
-            'maxRecords': 10
-        }
+        center_lon = (min_lon + max_lon) / 2.0
+        center_lat = (min_lat + max_lat) / 2.0
 
-        print(f"\nSearching for image near {target_date.strftime('%Y-%m-%d')} using CDSE...")
+        half_width = (max_lon - min_lon) / 2.0 * self.zoom_factor
+        half_height = (max_lat - min_lat) / 2.0 * self.zoom_factor
 
+        # Clamp to valid lon/lat ranges
+        bbox_min_lon = max(-180.0, center_lon - half_width)
+        bbox_max_lon = min(180.0, center_lon + half_width)
+        bbox_min_lat = max(-90.0, center_lat - half_height)
+        bbox_max_lat = min(90.0, center_lat + half_height)
+
+        bbox = (bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat)
+        
+        print(f"\nSearching for image near {target_date.strftime('%Y-%m-%d')}...")
+        print(f"  Search window: {start_date} to {end_date}")
+        print(f"  Bounding box: {bbox}")
+        
         try:
-            # Use CDSE search URL; session headers should include Authorization if token provided
-            response = self.session.get(self.CDSE_SEARCH_URL, params=params, timeout=30)
-            response.raise_for_status()
-
-            data = response.json()
-            features = data.get('features', [])
-
-            if not features:
-                print(f"No cloud-free images found near {target_date.strftime('%Y-%m-%d')}")
-                print("Creating synthetic image for demo...")
-                return self._create_synthetic_image(output_dir, filename)
-
-            # Choose best feature (lowest cloud cover) if available
-            best_feat = None
-            best_cloud = None
-            for feat in features:
-                props = feat.get('properties', {})
-                cloud = props.get('cloudCover') or props.get('cloud_cover') or props.get('eo:cloud_cover')
-                try:
-                    cloud_val = float(cloud) if cloud is not None else None
-                except Exception:
-                    cloud_val = None
-
-                if cloud_val is not None:
-                    if best_cloud is None or cloud_val < best_cloud:
-                        best_cloud = cloud_val
-                        best_feat = feat
-
-            if best_feat is None:
-                # fallback to first feature
-                best_feat = features[0]
-
-            # Extract identifier for downloading
-            product_id = best_feat.get('id') or best_feat.get('properties', {}).get('productIdentifier') or best_feat.get('properties', {}).get('title')
-            title = best_feat.get('properties', {}).get('title', product_id)
-
-            print(f"Found image: {title} (product id: {product_id})")
-
-            # Download using the entire feature (may contain browse/quicklook links)
-            return self._download_and_process(best_feat, output_dir, filename)
-
+            # Search using short_name like the notebook (searches HLSL30 and HLSS30)
+            # This searches across both Landsat and Sentinel-2 HLS datasets
+            print(f"  Querying CMR for HLS data (HLSL30, HLSS30)...")
+            results = earthaccess.search_data(
+                short_name=['HLSL30', 'HLSS30'],
+                temporal=(start_date, end_date),
+                bounding_box=bbox,
+                count=30
+            )
+            
+            if results:
+                print(f"Found {len(results)} matching images")
+                
+                # Try to download from results
+                for i, result in enumerate(results):
+                    try:
+                        print(f"Attempting download {i+1}/{len(results)}...")
+                        
+                        # Download the granule
+                        files = earthaccess.download(
+                            result,
+                            local_path=os.path.join(output_dir, "_download_tmp"),
+                            threads=4
+                        )
+                        
+                        if files:
+                            print(f"Downloaded {len(files)} files, processing...")
+                            processed = self._process_downloaded_files(
+                                files, output_dir, filename
+                            )
+                            if processed:
+                                return processed
+                    except Exception as e:
+                        print(f"Download attempt {i+1} failed: {e}")
+                        continue
+            
+            # Try with broader date range if first attempt fails
+            if not results:
+                print(f"No results in initial window. Trying with ±45 days...")
+                start_date_broad = (target_date - timedelta(days=45)).strftime('%Y-%m-%d')
+                end_date_broad = (target_date + timedelta(days=45)).strftime('%Y-%m-%d')
+                results = earthaccess.search_data(
+                    short_name=['HLSL30', 'HLSS30'],
+                    temporal=(start_date_broad, end_date_broad),
+                    bounding_box=bbox,
+                    count=30
+                )
+                
+                if results:
+                    print(f"Found {len(results)} images (no cloud filter)")
+                    
+                    for i, result in enumerate(results[:10]):
+                        try:
+                            print(f"Attempting download {i+1}/10...")
+                            
+                            files = earthaccess.download(
+                                result,
+                                local_path=os.path.join(output_dir, "_download_tmp"),
+                                threads=4
+                            )
+                            
+                            if files:
+                                print(f"Downloaded {len(files)} files, processing...")
+                                processed = self._process_downloaded_files(
+                                    files, output_dir, filename
+                                )
+                                if processed:
+                                    return processed
+                        except Exception as e:
+                            print(f"Download attempt {i+1} failed: {e}")
+                            continue
+            
+            print("Could not download real Sentinel-2 data; creating synthetic...")
+            return self._create_synthetic_image(output_dir, filename)
+            
         except Exception as e:
-            print(f"Error downloading from CDSE: {e}")
+            print(f"Search error: {e}")
+            import traceback
+            traceback.print_exc()
             print("Creating synthetic image for demo...")
             return self._create_synthetic_image(output_dir, filename)
     
-    def _download_and_process(self, feature_or_id, output_dir, filename):
+    def _process_downloaded_files(self, files, output_dir, filename):
         """
-        Download Sentinel-2 product and extract RGB bands
+        Process downloaded files and extract RGB image
         
         Args:
-            product_id: Copernicus product ID
+            files: List of downloaded file paths
             output_dir: Output directory
             filename: Output filename
         
         Returns:
-            Path to processed image
+            Path to processed 416x416 image
         """
-        # Try to download a browse/quicklook image from the feature
-        print(f"Downloading product {feature_or_id}...")
-
-        # If a feature dict was passed, attempt to find a usable URL
-        url = None
-        if isinstance(feature_or_id, dict):
-            feat = feature_or_id
-            # Common locations for links
-            candidates = []
-            if 'links' in feat and isinstance(feat['links'], list):
-                candidates.extend([l.get('href') or l.get('url') for l in feat['links']])
-            props = feat.get('properties', {})
-            # props may contain common keys
-            for key in ('browseURL', 'browseurl', 'quicklook', 'quicklook_url', 'link', 'thumbnail', 'thumbnail_url', 'browse'):
-                if key in props:
-                    candidates.append(props.get(key))
-            # assets or additional properties
-            assets = feat.get('assets') or props.get('assets') or {}
-            if isinstance(assets, dict):
-                for a in assets.values():
-                    if isinstance(a, dict):
-                        candidates.append(a.get('href') or a.get('url'))
-
-            # Also scan property values for any image URL
-            for v in props.values():
-                if isinstance(v, str) and v.lower().startswith('http') and any(ext in v.lower() for ext in ('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
-                    candidates.append(v)
-
-            # Flatten and pick first URL with an image or tiff extension
-            for c in candidates:
-                if not c:
-                    continue
-                if any(ext in c.lower() for ext in ('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
-                    url = c
-                    break
-
-        # If feature_or_id is a plain id/string, we don't have links; fall back
-        if not url:
-            print("No browse/quicklook URL found for product; falling back to synthetic image")
-            return self._create_synthetic_image(output_dir, filename)
-
-        # Download the image
+        import rioxarray as rxr
+        
+        print(f"Processing {len(files)} downloaded files...")
+        
         try:
-            resp = self.session.get(url, stream=True, timeout=120)
-            resp.raise_for_status()
-            tmp_path = os.path.join(output_dir, f"_download_tmp")
-            with open(tmp_path, 'wb') as f:
-                for chunk in resp.iter_content(8192):
-                    f.write(chunk)
-
-            # If image, read and resize to 416x416
-            lower = url.lower()
-            output_path = os.path.join(output_dir, filename)
-            if any(lower.endswith(ext) for ext in ('.jpg', '.jpeg', '.png')):
-                img = cv2.imread(tmp_path)
-                if img is None:
-                    raise ValueError("Downloaded preview is not a valid image")
-                resized = cv2.resize(img, (416, 416))
-                cv2.imwrite(output_path, resized)
-                os.remove(tmp_path)
-                print(f"Saved preview as: {output_path}")
-                return output_path
-
-            # If GeoTIFF, try to read bands using rasterio
-            if any(lower.endswith(ext) for ext in ('.tif', '.tiff')):
+            # Convert Path objects to strings
+            files = [str(f) for f in files]
+            
+            # Debug: show what files we're getting
+            if files:
+                print(f"Sample files:")
+                for f in files[:3]:
+                    print(f"  - {os.path.basename(f)}")
+            
+            # For HLS Sentinel-2, we need RGB bands: B02 (Blue), B03 (Green), B04 (Red)
+            # These are separate files, so load them and stack
+            rgb_bands = {'B02': None, 'B03': None, 'B04': None}
+            
+            for file_path in files:
+                basename = os.path.basename(file_path.upper())
+                for band in rgb_bands.keys():
+                    # Check if this file contains the band
+                    if f'.{band}.' in basename or basename.endswith(f'{band}.TIF'):
+                        try:
+                            print(f"Loading {band} from {os.path.basename(file_path)}...")
+                            data = rxr.open_rasterio(file_path)
+                            rgb_bands[band] = data.values[0]  # Extract first (only) band
+                            print(f"  Shape: {rgb_bands[band].shape}")
+                        except Exception as e:
+                            print(f"Could not load {band}: {e}")
+            
+            # Check if we have all RGB bands
+            if all(v is not None for v in rgb_bands.values()):
+                print("Creating RGB composite from B02, B03, B04...")
+                # Try to locate the exact file paths for each band so we can save a stacked GeoTIFF
+                da_b02_clipped = None
+                da_b03_clipped = None
+                da_b04_clipped = None
                 try:
-                    import rasterio
-                    with rasterio.open(tmp_path) as ds:
-                        # Sentinel-2 RGB bands are usually 4(R),3(G),2(B) at 10m
-                        # Attempt to read these bands (band indexes may vary)
-                        # We'll try common bands: 4,3,2
-                        bands = []
-                        for b in (4, 3, 2):
-                            try:
-                                arr = ds.read(b)
-                                bands.append(arr)
-                            except Exception:
-                                bands = []
-                                break
-                        if len(bands) == 3:
-                            # Stack and normalize to uint8
-                            rgb = np.dstack(bands)
-                            # Simple rescale to 0-255
-                            rgb_min, rgb_max = rgb.min(), rgb.max()
-                            if rgb_max > rgb_min:
-                                rgb = (rgb - rgb_min) / (rgb_max - rgb_min) * 255.0
-                            rgb = rgb.astype('uint8')
-                            resized = cv2.resize(rgb, (416, 416))
-                            cv2.imwrite(output_path, resized)
-                            os.remove(tmp_path)
-                            print(f"Saved extracted RGB to: {output_path}")
-                            return output_path
+                    b02_path = next(f for f in files if '.B02.' in os.path.basename(f).upper() or os.path.basename(f).upper().endswith('B02.TIF'))
+                    b03_path = next(f for f in files if '.B03.' in os.path.basename(f).upper() or os.path.basename(f).upper().endswith('B03.TIF'))
+                    b04_path = next(f for f in files if '.B04.' in os.path.basename(f).upper() or os.path.basename(f).upper().endswith('B04.TIF'))
+
+                    # Open as DataArrays so we can stack and save as multi-band GeoTIFF
+                    da_b02 = rxr.open_rasterio(b02_path).squeeze()
+                    da_b03 = rxr.open_rasterio(b03_path).squeeze()
+                    da_b04 = rxr.open_rasterio(b04_path).squeeze()
+
+                    # Reproject field to match the image CRS if needed
+                    common_crs = da_b02.rio.crs
+                    if common_crs is None:
+                        print("Raster CRS missing; cannot verify AOI. Skipping this granule.")
+                        return None
+                    if self.field.crs != common_crs:
+                        field_reprojected = self.field.to_crs(common_crs)
+                    else:
+                        field_reprojected = self.field
+
+                    # Clip each band to the field polygon (following notebook pattern)
+                    print(f"Clipping bands to polygon geometry...")
+                    try:
+                        da_b02_clipped = da_b02.rio.clip(field_reprojected.geometry.values, drop=True, all_touched=True)
+                        da_b03_clipped = da_b03.rio.clip(field_reprojected.geometry.values, drop=True, all_touched=True)
+                        da_b04_clipped = da_b04.rio.clip(field_reprojected.geometry.values, drop=True, all_touched=True)
+                    except Exception as e:
+                        print(f"Clipping failed: {e}. Skipping this granule.")
+                        return None
+
+                    # If the clipped data is empty or entirely invalid, the granule doesn't intersect AOI
+                    if da_b02_clipped.size == 0 or da_b03_clipped.size == 0 or da_b04_clipped.size == 0:
+                        print("Clipped area is empty; skipping this granule.")
+                        return None
+                    if not np.isfinite(da_b02_clipped.values).any():
+                        print("Clipped area contains no valid data; skipping this granule.")
+                        return None
+
+                    stacked = xr.concat([da_b04_clipped, da_b03_clipped, da_b02_clipped], dim='band')
+                    stacked['band'] = ['B04', 'B03', 'B02']
+
+                    out_tif = os.path.join(output_dir, f"stacked_{os.path.splitext(os.path.basename(b02_path))[0]}.tif")
+                    try:
+                        stacked.rio.to_raster(out_tif)
+                        print(f"Saved clipped stacked GeoTIFF: {out_tif}")
+                    except Exception as e:
+                        print(f"Could not save stacked GeoTIFF: {e}")
+                except StopIteration:
+                    print("Could not locate all band file paths to save stacked GeoTIFF")
+                    return None
                 except Exception as e:
-                    print(f"Rasterio read failed: {e}")
+                    print(f"Error creating stacked GeoTIFF: {e}")
+                    return None
 
-            # If we get here, couldn't process downloaded file
-            print("Downloaded file couldn't be processed; using synthetic image")
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-            return self._create_synthetic_image(output_dir, filename)
+                # Stack as BGR for OpenCV (Blue, Green, Red) using clipped arrays
+                if da_b02_clipped is None or da_b03_clipped is None or da_b04_clipped is None:
+                    print("Clipped data not available; skipping this granule.")
+                    return None
+                bgr = np.stack(
+                    [
+                        da_b02_clipped.values,
+                        da_b03_clipped.values,
+                        da_b04_clipped.values,
+                    ],
+                    axis=2,
+                )
 
+                # Normalize to 0-255
+                bgr = self._normalize_to_uint8(bgr)
+                bgr = self._enhance_bgr(bgr)
+
+                # Resize to 416x416
+                resized = cv2.resize(bgr, (416, 416), interpolation=cv2.INTER_AREA)
+                output_path = os.path.join(output_dir, filename)
+                cv2.imwrite(output_path, resized)
+
+                print(f"Saved processed image: {output_path} (size: {resized.shape})")
+                return output_path
+            else:
+                missing = [b for b, v in rgb_bands.items() if v is None]
+                print(f"Missing bands: {missing}, cannot create RGB composite")
+            
+            # Try any TIF file as fallback
+            tif_files = [f for f in files if f.lower().endswith('.tif')]
+            if tif_files:
+                for tif_file in tif_files:
+                    try:
+                        data = rxr.open_rasterio(tif_file)
+                        
+                        if data.shape[0] >= 3:
+                            rgb = data[:3].values.transpose(1, 2, 0)
+                            
+                            rgb = self._normalize_to_uint8(rgb)
+                            rgb = self._enhance_bgr(rgb)
+                            
+                            resized = cv2.resize(rgb, (416, 416), interpolation=cv2.INTER_AREA)
+                            output_path = os.path.join(output_dir, filename)
+                            cv2.imwrite(output_path, resized)
+                            
+                            print(f"Saved processed image: {output_path}")
+                            return output_path
+                    except Exception as e:
+                        pass
+            
+            print("Could not process any files")
+            return None
+            
         except Exception as e:
-            print(f"Error downloading preview: {e}")
-            return self._create_synthetic_image(output_dir, filename)
+            print(f"Processing error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def _create_synthetic_image(self, output_dir, filename):
         """
@@ -316,49 +477,21 @@ class Sentinel2Downloader:
         Returns:
             Path to created image
         """
-        # Create realistic RGB image (Sentinel-2 bands 4, 3, 2)
-        # Simulate satellite imagery with terrain variations
         image = np.zeros((416, 416, 3), dtype=np.uint8)
         
-        # Add terrain-like patterns
         x, y = np.meshgrid(np.linspace(0, 4, 416), np.linspace(0, 4, 416))
         
-        # Red channel - vegetation indices
         image[:, :, 0] = np.uint8(100 + 50 * np.sin(x) * np.cos(y))
-        
-        # Green channel - vegetation
         image[:, :, 1] = np.uint8(120 + 60 * np.sin(x + 0.5) * np.cos(y + 0.5))
-        
-        # Blue channel - water/shadows
         image[:, :, 2] = np.uint8(80 + 40 * np.sin(x + 1) * np.cos(y + 1))
         
-        # Add some realistic noise
         noise = np.random.normal(0, 5, image.shape)
         image = np.uint8(np.clip(image + noise, 0, 255))
         
-        # Save image
         output_path = os.path.join(output_dir, filename)
         cv2.imwrite(output_path, image)
-        print(f"Created image: {output_path}")
+        print(f"Created synthetic image: {output_path}")
         
-        return output_path
-    
-    def crop_to_geojson(self, image_path, output_path):
-        """
-        Crop image to GeoJSON area
-        
-        Args:
-            image_path: Input image path
-            output_path: Output image path
-        
-        Returns:
-            Path to cropped image
-        """
-        image = cv2.imread(image_path)
-        # For now, resize to 416x416
-        # In production, would use geo-referencing to crop correctly
-        resized = cv2.resize(image, (416, 416))
-        cv2.imwrite(output_path, resized)
         return output_path
 
 
@@ -371,12 +504,11 @@ def get_sentinel2_images(username=None, password=None, geojson_path=None, output
         password: Earthdata password
         geojson_path: Path to GeoJSON file
         output_dir: Output directory
+        token: Optional token (not used)
     
     Returns:
         Tuple of (before_image_path, after_image_path)
     """
-    # Accept token passed in via username if caller uses positional args.
-    # For explicit token support, caller should pass token via keyword.
     downloader = Sentinel2Downloader(username, password, geojson_path, token=token)
     before_path, after_path = downloader.download_images(output_dir)
     return before_path, after_path
